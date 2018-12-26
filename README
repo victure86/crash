@@ -36,8 +36,8 @@
  
   These are the current prerequisites: 
 
-  o  At this point, x86, ia64, x86_64, ppc64, ppc, arm, arm64, alpha, s390
-     and s390x-based kernels are supported.  Other architectures may be
+  o  At this point, x86, ia64, x86_64, ppc64, ppc, arm, arm64, alpha, mips,
+     s390 and s390x-based kernels are supported.  Other architectures may be
      addressed in the future.
 
   o  One size fits all -- the utility can be run on any Linux kernel version
@@ -74,12 +74,12 @@
 
   To build the crash utility: 
 
-    $ tar -xf crash-7.0.5.tar.gz
-    $ cd crash-7.0.5
+    $ tar -xf crash-7.2.4.tar.gz
+    $ cd crash-7.2.4
     $ make
 
   The initial build will take several minutes  because the embedded gdb module
-  must be configured and and built.  Alternatively, the crash source RPM file
+  must be configured and built.  Alternatively, the crash source RPM file
   may be installed and built, and the resultant crash binary RPM file installed.
 
   The crash binary can only be used on systems of the same architecture as
@@ -90,6 +90,8 @@
      32-bit x86 dumpfiles may be built by typing "make target=X86".
   o  On an x86 or x86_64 host, a 32-bit x86 binary that can be used to analyze
      32-bit arm dumpfiles may be built by typing "make target=ARM".
+  o  On an x86 or x86_64 host, a 32-bit x86 binary that can be used to analyze
+     32-bit mips dumpfiles may be built by typing "make target=MIPS".
   o  On an ppc64 host, a 32-bit ppc binary that can be used to analyze
      32-bit ppc dumpfiles may be built by typing "make target=PPC".
   o  On an x86_64 host, an x86_64 binary that can be used to analyze
@@ -114,7 +116,7 @@
   If neither /dev/mem or /dev/crash are available, then /proc/kcore will be
   be used as the live memory source.  If /proc/kcore is also restricted, then
   the Red Hat /dev/crash driver may be compiled and installed; its source
-  is included in the crash-7.0.5/memory_driver subdirectory.
+  is included in the crash-7.2.4/memory_driver subdirectory.
 
   If the kernel file is stored in /boot, /, /boot/efi, or in any /usr/src
   or /usr/lib/debug/lib/modules subdirectory, then no command line arguments
@@ -125,8 +127,8 @@
 
     $ crash
     
-    crash 7.0.5
-    Copyright (C) 2002-2014  Red Hat, Inc.
+    crash 7.2.4
+    Copyright (C) 2002-2017  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
     Copyright (C) 2005, 2006, 2011, 2012  Fujitsu Limited
@@ -150,7 +152,7 @@
           KERNEL: /boot/vmlinux
         DUMPFILE: /dev/mem
             CPUS: 1
-            DATE: Fri Feb 14 11:28:13 2014
+            DATE: Fri Sep 21 14:54:38 2018
           UPTIME: 10 days, 22:55:18
     LOAD AVERAGE: 0.08, 0.03, 0.01
            TASKS: 42
@@ -167,18 +169,18 @@
 
     crash> help
 
-    *              files          mach           repeat         timer          
-    alias          foreach        mod            runq           tree           
-    ascii          fuser          mount          search         union          
+    *              extend         log            rd             task           
+    alias          files          mach           repeat         timer          
+    ascii          foreach        mod            runq           tree           
+    bpf            fuser          mount          search         union          
     bt             gdb            net            set            vm             
     btop           help           p              sig            vtop           
     dev            ipcs           ps             struct         waitq          
     dis            irq            pte            swap           whatis         
     eval           kmem           ptob           sym            wr             
     exit           list           ptov           sys            q              
-    extend         log            rd             task           
     
-    crash version: 7.0.5    gdb version: 7.6
+    crash version: 7.2.4    gdb version: 7.6
     For help on any command above, enter "help <command>".
     For help on input options, enter "help input".
     For help on output options, enter "help output".
@@ -191,8 +193,8 @@
 
     $ crash vmlinux vmcore
  
-    crash 7.0.5
-    Copyright (C) 2002-2014  Red Hat, Inc.
+    crash 7.2.4
+    Copyright (C) 2002-2017  Red Hat, Inc.
     Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
     Copyright (C) 1999-2006  Hewlett-Packard Co
     Copyright (C) 2005, 2006, 2011, 2012  Fujitsu Limited
@@ -342,7 +344,7 @@
 
   Alternatively, you can create shared object library files consisting of
   crash command extensions, that can be dynamically linked into the crash
-  executable during runtime or during initialization.  This will allow the
+  executable during runtime or during initialization.  This will allow
   the same shared object to be used with subsequent crash releases without
   having to re-merge the command's code into each new set of crash sources.
   The dynamically linked-in commands will automatically show up in the crash

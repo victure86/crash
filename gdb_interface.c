@@ -1,8 +1,8 @@
 /* gdb_interface.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2013 David Anderson
- * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2015,2018 David Anderson
+ * Copyright (C) 2002-2015,2018 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -512,6 +512,10 @@ dump_gnu_request(struct gnu_request *req, int in_gdb)
 	console("member_offset: %ld\n", req->member_offset);
 	console("member_length: %ld\n", req->member_length);
         console("member_typecode: %d\n", req->member_typecode);
+	console("member_main_type_name: %s\n", req->member_main_type_name);
+	console("member_main_type_tag_name: %s\n", req->member_main_type_tag_name);
+	console("member_target_type_name: %s\n", req->member_target_type_name);
+	console("member_target_type_tag_name: %s\n", req->member_target_type_tag_name);
 	console("value: %lx ", req->value);
 	console("tagname: \"%s\" ", req->tagname);
 	console("pc: %lx  ", req->pc);
@@ -592,6 +596,9 @@ gdb_command_string(int cmd, char *buf, int live)
         case GNU_SET_CRASH_BLOCK:
                 sprintf(buf, "GNU_SET_CRASH_BLOCK");
 		break;
+	case GNU_GET_FUNCTION_RANGE:
+                sprintf(buf, "GNU_GET_FUNCTION_RANGE");
+                break;
 	case 0:
 		buf[0] = NULLCHAR;
 		break;
@@ -734,6 +741,13 @@ is_restricted_command(char *cmd, ulong flags)
 				newline, newline, pc->program_name);
 		}
 	}
+
+	if (kt->relocate && 
+	    STRNEQ("disassemble", cmd) && STRNEQ(cmd, "disas"))
+               	error(FATAL, 
+		    "the gdb \"disassemble\" command is prohibited because the kernel text\n"
+		    "%swas relocated%s; use the crash \"dis\" command instead.\n",
+			space(strlen(pc->curcmd)+2), kt->flags2 & KASLR ? " by KASLR" : "");
 	
 	return FALSE;
 }
@@ -788,7 +802,7 @@ cmd_gdb(void)
 	 */
 	if (!is_restricted_command(*argv, FAULT_ON_ERROR)) {
 		if (STREQ(pc->command_line, "gdb")) {
-			strcpy(buf, &pc->orig_line[3]);
+			strcpy(buf, first_space(pc->orig_line));
 			strip_beginning_whitespace(buf);
 		} else
 			strcpy(buf, pc->orig_line);
@@ -812,12 +826,20 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 	char locbuf[SIZEOF_32BIT], *p1;
 	uint32_t *p2;
 	int memtype;
+	ulong readflags;
 
 	if (write)
 		return FALSE;
 
 	if (pc->cur_req->flags & GNU_NO_READMEM)
 		return TRUE;
+
+	readflags = pc->curcmd_flags & PARTIAL_READ_OK ?
+		RETURN_ON_ERROR|RETURN_PARTIAL : RETURN_ON_ERROR;
+
+	if (STREQ(pc->curcmd, "bpf") && pc->curcmd_private &&
+	    (addr > (ulong)pc->curcmd_private))
+		readflags |= QUIET;
 
 	if (pc->curcmd_flags & MEMTYPE_UVADDR)
 		memtype = UVADDR;
@@ -842,18 +864,24 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 
 	if (memtype == FILEADDR)
 		return(readmem(pc->curcmd_private, memtype, buf, len,
-                	"gdb_readmem_callback", RETURN_ON_ERROR));
+			"gdb_readmem_callback", readflags));
 	
 	switch (len)
 	{
 	case SIZEOF_8BIT:
+		if (STREQ(pc->curcmd, "bt")) {
+			if (readmem(addr, memtype, buf, SIZEOF_8BIT,
+		    	    "gdb_readmem_callback", readflags)) 
+				return TRUE;
+		}
+
 		p1 = (char *)buf;
 		if ((memtype == KVADDR) && 
 		    text_value_cache_byte(addr, (unsigned char *)p1)) 
 			return TRUE;
 
 		if (!readmem(addr, memtype, locbuf, SIZEOF_32BIT,
-		    "gdb_readmem_callback", RETURN_ON_ERROR)) 
+		    "gdb_readmem_callback", readflags)) 
 			return FALSE;
 
 		*p1 = locbuf[0];
@@ -864,11 +892,17 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 		return TRUE;
 
 	case SIZEOF_32BIT:
+		if (STREQ(pc->curcmd, "bt")) {
+			if (readmem(addr, memtype, buf, SIZEOF_32BIT,
+		    	    "gdb_readmem_callback", readflags)) 
+				return TRUE;
+		}
+
 		if ((memtype == KVADDR) && text_value_cache(addr, 0, buf)) 
 			return TRUE;
 
 		if (!readmem(addr, memtype, buf, SIZEOF_32BIT, 
-		    "gdb_readmem callback", RETURN_ON_ERROR))
+		    "gdb_readmem callback", readflags))
 			return FALSE;
 
 		if (memtype == KVADDR)
@@ -877,9 +911,8 @@ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
 		return TRUE;
 	}
 
-	return(readmem(addr, memtype, buf, len,
-                "gdb_readmem_callback", RETURN_ON_ERROR));
-
+	return(readmem(addr, memtype, buf, len, 
+		"gdb_readmem_callback", readflags));
 }
 
 /*
@@ -989,7 +1022,8 @@ gdb_set_crash_scope(ulong vaddr, char *arg)
 				return FALSE;
 			}
 		}
-	}
+	} else if (kt->flags2 & KASLR)
+		vaddr -= (kt->relocate * -1);
 
 	req->command = GNU_SET_CRASH_BLOCK;
 	req->addr = vaddr;

@@ -1,8 +1,8 @@
 /* filesys.c - core analysis suite
  *
  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2013 David Anderson
- * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2018 David Anderson
+ * Copyright (C) 2002-2018 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,6 +16,7 @@
  */
 
 #include "defs.h"
+#include <sys/sysmacros.h>
 #include <linux/major.h>
 #include <regex.h>
 #include <sys/utsname.h>
@@ -25,6 +26,7 @@ static int find_booted_kernel(void);
 static int find_booted_system_map(void);
 static int verify_utsname(char *);
 static char **build_searchdirs(int, int *);
+static int build_kernel_directory(char *);
 static int redhat_kernel_directory_v1(char *);
 static int redhat_kernel_directory_v2(char *);
 static int redhat_debug_directory(char *);
@@ -44,10 +46,11 @@ static int insmod_memory_driver_module(void);
 static int get_memory_driver_dev(dev_t *);
 static int memory_driver_init(void);
 static int create_memory_device(dev_t);
-static void *radix_tree_lookup(ulong, ulong, int);
 static int match_file_string(char *, char *, char *);
 static ulong get_root_vfsmount(char *);
-
+static void check_live_arch_mismatch(void);
+static long get_inode_nrpages(ulong);
+static void dump_inode_page_cache_info(ulong);
 
 #define DENTRY_CACHE (20)
 #define INODE_CACHE  (20)
@@ -112,6 +115,8 @@ fd_init(void)
 				error(INFO, "namelist argument required\n");
 				program_usage(SHORT_FORM);
 			}
+			if (!pc->dumpfile)
+				check_live_arch_mismatch();
 			if (!find_booted_kernel())
 	                	program_usage(SHORT_FORM);
 		}
@@ -128,7 +133,7 @@ fd_init(void)
 			pc->nfd = -1;
 		}
 
-		if (ACTIVE() && !(pc->namelist_debug || pc->system_map)) {
+		if (LOCAL_ACTIVE() && !(pc->namelist_debug || pc->system_map)) {
 			memory_source_init();
 			match_proc_version();
 		}
@@ -136,6 +141,9 @@ fd_init(void)
 	}
 
 	memory_source_init();
+
+	if (ACTIVE())
+		proc_kcore_init(fp, UNUSED);
 
 	if (CRASHDEBUG(1)) {
 		fprintf(fp, "readmem: %s() ", readmem_function_name());
@@ -156,13 +164,13 @@ fd_init(void)
 static void
 memory_source_init(void)
 {
-	if (REMOTE() && !(pc->flags & MEMSRC_LOCAL))
+	if (REMOTE() && !(pc->flags2 & MEMSRC_LOCAL))
 		return;
 
 	if (pc->flags & KERNEL_DEBUG_QUERY)
 		return;
 
-        if (ACTIVE()) {
+        if (LOCAL_ACTIVE()) {
 		if (pc->mfd != -1)  /* already been here */
 			return;
 
@@ -191,12 +199,16 @@ memory_source_init(void)
 			if ((pc->mfd = open("/proc/kcore", O_RDONLY)) < 0)
 				error(FATAL, "/proc/kcore: %s\n", 
 					strerror(errno));
-			if (!proc_kcore_init(fp))
+			if (!proc_kcore_init(fp, pc->mfd))
 				error(FATAL, 
 				    "/proc/kcore: initialization failed\n");
-		} else
-			error(FATAL, "unknown memory device: %s\n",
-				pc->live_memsrc);
+		} else {
+			if (!pc->live_memsrc)
+				error(FATAL, "cannot find a live memory device\n");
+			else
+				error(FATAL, "unknown memory device: %s\n",
+					pc->live_memsrc);
+		}
 
 		return;
         } 
@@ -239,6 +251,10 @@ memory_source_init(void)
 					pc->dumpfile);
 		} else if (pc->flags & S390D) { 
 			if (!s390_dump_init(pc->dumpfile))
+				error(FATAL, "%s: initialization failed\n",
+                                        pc->dumpfile);
+		} else if (pc->flags & VMWARE_VMSS) {
+			if (!vmware_vmss_init(pc->dumpfile, fp))
 				error(FATAL, "%s: initialization failed\n",
                                         pc->dumpfile);
 		}
@@ -299,6 +315,7 @@ match_proc_version(void)
 #define CREATE  1
 #define DESTROY 0
 #define DEFAULT_SEARCHDIRS 5
+#define EXTRA_SEARCHDIRS 5
 
 static char **
 build_searchdirs(int create, int *preferred)
@@ -331,11 +348,15 @@ build_searchdirs(int create, int *preferred)
 		*preferred = 0;
 
 	/*
-	 *  Allow, at a minimum, the defaults plus an extra three directories 
-	 *  for the two possible /usr/src/redhat/BUILD/kernel-xxx locations 
-	 *  plus the Red Hat debug directory.
+	 *  Allow, at a minimum, the defaults plus an extra four directories: 
+	 *
+	 *    /lib/modules
+	 *    /usr/src/redhat/BUILD/kernel-<version>/linux
+	 *    /usr/src/redhat/BUILD/kernel-<version>/linux-<version>
+	 *    /usr/lib/debug/lib/modules
+	 *
 	 */  
-	cnt = DEFAULT_SEARCHDIRS + 3;  
+	cnt = DEFAULT_SEARCHDIRS + EXTRA_SEARCHDIRS;  
 
         if ((dirp = opendir("/usr/src"))) {
                 for (dp = readdir(dirp); dp != NULL; dp = readdir(dirp)) 
@@ -385,12 +406,23 @@ build_searchdirs(int create, int *preferred)
 		if ((searchdirs = calloc(cnt, sizeof(char *))) == NULL) {
 			error(INFO, "search directory list malloc: %s\n",
                                 strerror(errno));
-			closedir(dirp);
 			return default_searchdirs;
 		} 
 		for (i = 0; i < DEFAULT_SEARCHDIRS; i++) 
 			searchdirs[i] = default_searchdirs[i];
 		cnt = DEFAULT_SEARCHDIRS;
+	}
+
+	if (build_kernel_directory(dirbuf)) {
+		if ((searchdirs[cnt] = (char *)
+		    malloc(strlen(dirbuf)+2)) == NULL) {
+			error(INFO,
+			    "/lib/modules/ directory entry malloc: %s\n",
+				strerror(errno));
+		} else {
+			sprintf(searchdirs[cnt], "%s/", dirbuf);
+			cnt++;
+		}
 	}
 
         if (redhat_kernel_directory_v1(dirbuf)) {
@@ -447,6 +479,27 @@ build_searchdirs(int create, int *preferred)
 	}
 
 	return searchdirs;
+}
+
+static int
+build_kernel_directory(char *buf)
+{
+	char *p1, *p2;
+
+	if (!strstr(kt->proc_version, "Linux version "))
+		return FALSE;
+
+	BZERO(buf, BUFSIZE);
+	sprintf(buf, "/lib/modules/");
+
+	p1 = &kt->proc_version[strlen("Linux version ")];
+	p2 = &buf[strlen(buf)];
+
+	while (*p1 != ' ')
+		*p2++ = *p1++;
+
+	strcat(buf, "/build");
+	return TRUE;
 }
 
 static int
@@ -579,7 +632,7 @@ find_booted_kernel(void)
 
 			if (mount_point(kernel) ||
 			    !file_readable(kernel) || 
-                            !is_elf_file(kernel))
+                            !is_kernel(kernel))
 				continue;
 
 			if (CRASHDEBUG(1)) 
@@ -1241,6 +1294,8 @@ cmd_mount(void)
 		(VALID_MEMBER(super_block_s_dirty) ? MOUNT_PRINT_INODES : 0), 
 		namespace_context);
 
+	pc->curcmd_flags &= ~HEADER_PRINTED;
+
 	do {
 		spec_string = args[optind];
 		if (STRNEQ(spec_string, "0x") && 
@@ -1318,10 +1373,10 @@ show_mounts(ulong one_vfsmount, int flags, struct task_context *namespace_contex
 	long s_dirty;
 	ulong devp, dirp, sbp, dirty, type, name;
 	struct list_data list_data, *ld;
-	char buf1[BUFSIZE];
+	char buf1[BUFSIZE*2];
 	char buf2[BUFSIZE];
 	char buf3[BUFSIZE];
-	char buf4[BUFSIZE];
+	char buf4[BUFSIZE/2];
 	ulong *dentry_list, *dp, *mntlist;
 	ulong *vfsmnt;
 	char *vfsmount_buf, *super_block_buf, *mount_buf;
@@ -1372,12 +1427,22 @@ show_mounts(ulong one_vfsmount, int flags, struct task_context *namespace_contex
 	if (flags == 0)
 		fprintf(fp, "%s", mount_hdr);
 
-	if ((flags & MOUNT_PRINT_FILES) &&
-	    (sb_s_files = OFFSET(super_block_s_files)) == INVALID_OFFSET) {
+	sb_s_files = VALID_MEMBER(super_block_s_files) ?
+		OFFSET(super_block_s_files) : INVALID_OFFSET;
+
+	if ((flags & MOUNT_PRINT_FILES) && (sb_s_files == INVALID_OFFSET)) {
 		/*
-		 * No open files list in super_block (2.2).  
-		 * Use inuse_filps list instead.
+		 *  super_block.s_files deprecated
 		 */
+		if (!kernel_symbol_exists("inuse_filps")) {
+			error(INFO, "the super_block.s_files linked list does "
+                                    "not exist in this kernel\n");
+			option_not_supported('f');
+		}
+		/*
+	  	 * No open files list in super_block (2.2).  
+	  	 * Use inuse_filps list instead.
+	  	 */
 		dentry_list = create_dentry_array(symbol_value("inuse_filps"), 
 			&cnt);
 	}
@@ -1436,8 +1501,8 @@ show_mounts(ulong one_vfsmount, int flags, struct task_context *namespace_contex
                         KVADDR, &name, sizeof(void *),
                         "file_system_type name", FAULT_ON_ERROR);
 
-                if (read_string(name, buf1, BUFSIZE-1))
-			sprintf(buf3, "%-6s ", buf1);
+                if (read_string(name, buf4, (BUFSIZE/2)-1))
+			sprintf(buf3, "%-6s ", buf4);
                 else
 			sprintf(buf3, "unknown ");
 
@@ -2025,25 +2090,6 @@ vfs_init(void)
 	if (!(ft->inode_cache = (char *)malloc(SIZE(inode)*INODE_CACHE)))
 		error(FATAL, "cannot malloc inode cache\n");
 
-	if (symbol_exists("height_to_maxindex")) {
-		int tmp ATTRIBUTE_UNUSED;
-		if (LKCD_KERNTYPES())
-			ARRAY_LENGTH_INIT_ALT(tmp, "height_to_maxindex",
-				"radix_tree_preload.nodes", NULL, 0);
-		else
-			ARRAY_LENGTH_INIT(tmp, height_to_maxindex,
-                        	"height_to_maxindex", NULL, 0);
-		STRUCT_SIZE_INIT(radix_tree_root, "radix_tree_root");
-		STRUCT_SIZE_INIT(radix_tree_node, "radix_tree_node");
-		MEMBER_OFFSET_INIT(radix_tree_root_height, 
-			"radix_tree_root","height");
-		MEMBER_OFFSET_INIT(radix_tree_root_rnode, 
-			"radix_tree_root","rnode");
-		MEMBER_OFFSET_INIT(radix_tree_node_slots, 
-			"radix_tree_node","slots");
-		MEMBER_OFFSET_INIT(radix_tree_node_height, 
-			"radix_tree_node","height");
-	}
 	MEMBER_OFFSET_INIT(rb_root_rb_node, 
 		"rb_root","rb_node");
 	MEMBER_OFFSET_INIT(rb_node_rb_left, 
@@ -2115,6 +2161,84 @@ show_hit_rates:
 }
 
 /*
+ * Get the page count for the specific mapping
+ */
+static long
+get_inode_nrpages(ulong i_mapping)
+{
+	char *address_space_buf;
+	ulong nrpages;
+
+	address_space_buf = GETBUF(SIZE(address_space));
+
+	readmem(i_mapping, KVADDR, address_space_buf,
+	    SIZE(address_space), "address_space buffer",
+	    FAULT_ON_ERROR);
+	nrpages = ULONG(address_space_buf + OFFSET(address_space_nrpages));
+
+	FREEBUF(address_space_buf);
+
+	return nrpages;
+}
+
+static void
+dump_inode_page_cache_info(ulong inode)
+{
+	char *inode_buf;
+	ulong i_mapping, nrpages, root_rnode, xarray, count;
+	struct list_pair lp;
+	char header[BUFSIZE];
+	char buf1[BUFSIZE];
+	char buf2[BUFSIZE];
+
+	inode_buf = GETBUF(SIZE(inode));
+	readmem(inode, KVADDR, inode_buf, SIZE(inode), "inode buffer",
+	    FAULT_ON_ERROR);
+
+	i_mapping = ULONG(inode_buf + OFFSET(inode_i_mapping));
+	nrpages = get_inode_nrpages(i_mapping);
+
+	sprintf(header, "%s  NRPAGES\n",
+		mkstring(buf1, VADDR_PRLEN, CENTER|LJUST, "INODE"));
+	fprintf(fp, "%s", header);
+
+	fprintf(fp, "%s  %s\n\n",
+		mkstring(buf1, VADDR_PRLEN,
+		CENTER|RJUST|LONG_HEX,
+		MKSTR(inode)),
+		mkstring(buf2, strlen("NRPAGES"),
+		RJUST|LONG_DEC,
+		MKSTR(nrpages)));
+
+	FREEBUF(inode_buf);
+
+	if (!nrpages)
+		return;
+
+	xarray = root_rnode = count = 0;
+	if (MEMBER_EXISTS("address_space", "i_pages") &&
+	    STREQ(MEMBER_TYPE_NAME("address_space", "i_pages"), "xarray"))
+		xarray = i_mapping + OFFSET(address_space_page_tree);
+	else 
+		root_rnode = i_mapping + OFFSET(address_space_page_tree);
+
+	lp.index = 0;
+	lp.value = (void *)&dump_inode_page;
+
+	if (root_rnode)
+		count = do_radix_tree(root_rnode, RADIX_TREE_DUMP_CB, &lp);
+	else if (xarray)
+		count = do_xarray(xarray, XARRAY_DUMP_CB, &lp);
+
+	if (count != nrpages)
+		error(INFO, "%s page count: %ld  nrpages: %ld\n",
+			root_rnode ? "radix tree" : "xarray",
+			count, nrpages);
+
+	return;
+}
+
+/*
  *  This command displays information about the open files of a context.
  *  For each open file descriptor the file descriptor number, a pointer
  *  to the file struct, pointer to the dentry struct, pointer to the inode 
@@ -2134,11 +2258,12 @@ cmd_files(void)
 	int subsequent;
 	struct reference reference, *ref;
 	char *refarg;
+	int open_flags = 0;
 
         ref = NULL;
         refarg = NULL;
 
-        while ((c = getopt(argcnt, args, "d:R:")) != EOF) {
+        while ((c = getopt(argcnt, args, "d:R:p:c")) != EOF) {
                 switch(c)
 		{
 		case 'R':
@@ -2157,6 +2282,23 @@ cmd_files(void)
 			display_dentry_info(value);
 			return;
 
+		case 'p':
+			if (VALID_MEMBER(address_space_page_tree) &&
+			    VALID_MEMBER(inode_i_mapping)) {
+				value = htol(optarg, FAULT_ON_ERROR, NULL);
+				dump_inode_page_cache_info(value);
+			} else
+				option_not_supported('p');
+			return;
+
+		case 'c':
+			if (VALID_MEMBER(address_space_nrpages) &&
+			    VALID_MEMBER(inode_i_mapping))
+				open_flags |= PRINT_NRPAGES;
+			else
+				option_not_supported('c');
+			break;
+
 		default:
 			argerrs++;
 			break;
@@ -2169,7 +2311,9 @@ cmd_files(void)
 	if (!args[optind]) {
 		if (!ref)
 			print_task_header(fp, CURRENT_CONTEXT(), 0);
-		open_files_dump(CURRENT_TASK(), 0, ref);
+
+		open_files_dump(CURRENT_TASK(), open_flags, ref);
+
 		return;
 	}
 
@@ -2188,7 +2332,7 @@ cmd_files(void)
                         for (tc = pid_to_context(value); tc; tc = tc->tc_next) {
                                 if (!ref)
                                         print_task_header(fp, tc, subsequent);
-                                open_files_dump(tc->task, 0, ref);
+                                open_files_dump(tc->task, open_flags, ref);
                                 fprintf(fp, "\n");
                         }
                         break;
@@ -2196,7 +2340,7 @@ cmd_files(void)
                 case STR_TASK:
                         if (!ref)
                                 print_task_header(fp, tc, subsequent);
-                        open_files_dump(tc->task, 0, ref);
+                        open_files_dump(tc->task, open_flags, ref);
                         break;
 
                 case STR_INVALID:
@@ -2253,7 +2397,8 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 	int max_fdset = 0;
 	int max_fds = 0;
 	ulong open_fds_addr;
-	fd_set open_fds;
+	int open_fds_size;
+	ulong *open_fds;
 	ulong fd;
 	ulong file;
 	ulong value;
@@ -2266,8 +2411,9 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 	char buf2[BUFSIZE];
 	char buf3[BUFSIZE];
 	char buf4[BUFSIZE];
-	char root_pwd[BUFSIZE];
+	char root_pwd[BUFSIZE*4];
 	int root_pwd_printed = 0;
+	int file_dump_flags = 0;
 
 	BZERO(root_pathname, BUFSIZE);
 	BZERO(pwd_pathname, BUFSIZE);
@@ -2276,15 +2422,27 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 		fdtable_buf = GETBUF(SIZE(fdtable));
 	fill_task_struct(task);
 
-	sprintf(files_header, " FD%s%s%s%s%s%s%sTYPE%sPATH\n",
-		space(MINSPACE),
-		mkstring(buf1, VADDR_PRLEN, CENTER|LJUST, "FILE"),
-		space(MINSPACE),
-		mkstring(buf2, VADDR_PRLEN, CENTER|LJUST, "DENTRY"),
-		space(MINSPACE),
-		mkstring(buf3, VADDR_PRLEN, CENTER|LJUST, "INODE"),
-		space(MINSPACE),
-		space(MINSPACE));
+	if (flags & PRINT_NRPAGES) {
+		sprintf(files_header, " FD%s%s%s%s%sNRPAGES%sTYPE%sPATH\n",
+			space(MINSPACE),
+			mkstring(buf1, VADDR_PRLEN, CENTER|LJUST, "INODE"),
+			space(MINSPACE),
+			mkstring(buf2, MAX(VADDR_PRLEN, strlen("I_MAPPING")),
+			BITS32() ? (CENTER|RJUST) : (CENTER|LJUST), "I_MAPPING"),
+			space(MINSPACE),
+			space(MINSPACE),
+			space(MINSPACE));
+	} else {
+		sprintf(files_header, " FD%s%s%s%s%s%s%sTYPE%sPATH\n",
+			space(MINSPACE),
+			mkstring(buf1, VADDR_PRLEN, CENTER|LJUST, "FILE"),
+			space(MINSPACE),
+			mkstring(buf2, VADDR_PRLEN, CENTER|LJUST, "DENTRY"),
+			space(MINSPACE),
+			mkstring(buf3, VADDR_PRLEN, CENTER|LJUST, "INODE"),
+			space(MINSPACE),
+			space(MINSPACE));
+	}
 
 	tc = task_to_context(task);
 
@@ -2443,16 +2601,25 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 		open_fds_addr = ULONG(files_struct_buf +
 			OFFSET(files_struct_open_fds));
 
+	open_fds_size = MAX(max_fdset, max_fds) / BITS_PER_BYTE;	
+	open_fds = (ulong *)GETBUF(open_fds_size);
+	if (!open_fds) {
+		if (fdtable_buf)
+			FREEBUF(fdtable_buf);
+		FREEBUF(files_struct_buf);
+		return;
+	}
+
 	if (open_fds_addr) {
 		if (VALID_MEMBER(files_struct_open_fds_init) && 
 		    (open_fds_addr == (files_struct_addr + 
 		    OFFSET(files_struct_open_fds_init)))) 
 			BCOPY(files_struct_buf + 
 			        OFFSET(files_struct_open_fds_init),
-				&open_fds, sizeof(fd_set));
+				open_fds, open_fds_size);
 		else
-			readmem(open_fds_addr, KVADDR, &open_fds,
-				sizeof(fd_set), "fdtable open_fds",
+			readmem(open_fds_addr, KVADDR, open_fds,
+				open_fds_size, "fdtable open_fds",
 				FAULT_ON_ERROR);
 	} 
 
@@ -2467,17 +2634,22 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 		if (fdtable_buf)
 			FREEBUF(fdtable_buf);
 		FREEBUF(files_struct_buf);
+		FREEBUF(open_fds);
 		return;
 	}
+
+	file_dump_flags = DUMP_FULL_NAME | DUMP_EMPTY_FILE;
+	if (flags & PRINT_NRPAGES)
+		file_dump_flags |= DUMP_FILE_NRPAGES;
 
 	j = 0;
 	for (;;) {
 		unsigned long set;
-		i = j * __NFDBITS;
+		i = j * BITS_PER_LONG;
 		if (((max_fdset >= 0) && (i >= max_fdset)) || 
 		    (i >= max_fds))
 			 break;
-		set = open_fds.__fds_bits[j++];
+		set = open_fds[j++];
 		while (set) {
 			if (set & 1) {
         			readmem(fd + i*sizeof(struct file *), KVADDR, 
@@ -2486,8 +2658,7 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 
 				if (ref && file) {
 					open_tmpfile();
-                                        if (file_dump(file, 0, 0, i,
-                                            DUMP_FULL_NAME|DUMP_EMPTY_FILE)) {
+                                        if (file_dump(file, 0, 0, i, file_dump_flags)) {
 						BZERO(buf4, BUFSIZE);
 						rewind(pc->tmpfile);
 						ret = fgets(buf4, BUFSIZE, 
@@ -2505,8 +2676,7 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 						fprintf(fp, "%s", files_header);
 						header_printed = 1;
 					}
-					file_dump(file, 0, 0, i, 
-						DUMP_FULL_NAME|DUMP_EMPTY_FILE);
+					file_dump(file, 0, 0, i, file_dump_flags);
 				}
 			}
 			i++;
@@ -2523,6 +2693,7 @@ open_files_dump(ulong task, int flags, struct reference *ref)
 	if (fdtable_buf)
 		FREEBUF(fdtable_buf);
 	FREEBUF(files_struct_buf);
+	FREEBUF(open_fds);
 }
 
 /*
@@ -2701,6 +2872,8 @@ file_dump(ulong file, ulong dentry, ulong inode, int fd, int flags)
 	char buf1[BUFSIZE];
 	char buf2[BUFSIZE];
 	char buf3[BUFSIZE];
+	ulong i_mapping = 0;
+	ulong nrpages = 0;
 
 	file_buf = NULL;
 
@@ -2810,6 +2983,28 @@ file_dump(ulong file, ulong dentry, ulong inode, int fd, int flags)
 				type, 
 				space(MINSPACE),
 				pathname+1);
+		} else if (flags & DUMP_FILE_NRPAGES) {
+			i_mapping = ULONG(inode_buf + OFFSET(inode_i_mapping));
+			nrpages = get_inode_nrpages(i_mapping);
+
+			fprintf(fp, "%3d%s%s%s%s%s%s%s%s%s%s\n",
+				fd,
+				space(MINSPACE),
+				mkstring(buf1, VADDR_PRLEN,
+				CENTER|RJUST|LONG_HEX,
+				MKSTR(inode)),
+				space(MINSPACE),
+				mkstring(buf2, MAX(VADDR_PRLEN, strlen("I_MAPPING")),
+				CENTER|RJUST|LONG_HEX,
+				MKSTR(i_mapping)),
+				space(MINSPACE),
+				mkstring(buf3, strlen("NRPAGES"),
+				RJUST|LONG_DEC,
+				MKSTR(nrpages)),
+				space(MINSPACE),
+				type,
+				space(MINSPACE),
+				pathname);
 		} else {
                         fprintf(fp, "%3d%s%s%s%s%s%s%s%s%s%s\n",
                                 fd,
@@ -2920,7 +3115,7 @@ get_pathname(ulong dentry, char *pathname, int length, int full, ulong vfsmnt)
 			break;
 
 		if (tmp_dentry != dentry) {
-			strncpy(tmpname, pathname, BUFSIZE);
+			strncpy(tmpname, pathname, BUFSIZE-1);
 			if (strlen(tmpname) + d_name_len < BUFSIZE) {
 				if ((d_name_len > 1 || !STREQ(buf, "/")) &&
 				    !STRNEQ(tmpname, "/")) {
@@ -3451,8 +3646,8 @@ get_live_memory_source(void)
 {
 	FILE *pipe;
 	char buf[BUFSIZE];
-	char modname1[BUFSIZE];
-	char modname2[BUFSIZE];
+	char modname1[BUFSIZE/2];
+	char modname2[BUFSIZE/2];
 	char *name;
 	int use_module, crashbuiltin;
 	struct stat stat1, stat2;
@@ -3463,7 +3658,13 @@ get_live_memory_source(void)
 	if (pc->live_memsrc)
 		goto live_report;
 
-	pc->live_memsrc = "/dev/mem";
+	if (file_exists("/dev/mem", NULL))
+		pc->live_memsrc = "/dev/mem";
+	else if (file_exists("/proc/kcore", NULL)) {
+		pc->flags &= ~DEVMEM;
+		pc->flags |= PROC_KCORE;
+		pc->live_memsrc = "/proc/kcore";
+	}
 	use_module = crashbuiltin = FALSE;
 
 	if (file_exists("/dev/mem", &stat1) &&
@@ -3500,6 +3701,11 @@ get_live_memory_source(void)
 					utsname.release, modname2);
 				if (file_exists(buf, &stat1))
 					use_module = TRUE;
+				else {
+					strcat(buf, ".xz");
+					if (file_exists(buf, &stat1))
+						use_module = TRUE;
+				}
 				break;
 			}
 			name = basename(strip_linefeeds(buf));
@@ -3517,7 +3723,7 @@ get_live_memory_source(void)
 	}
 
 	if (use_module) {
-		pc->flags &= ~DEVMEM;
+		pc->flags &= ~(DEVMEM|PROC_KCORE);
 		pc->flags |= MEMMOD;
 		pc->readmem = read_memory_device;
 		pc->writemem = write_memory_device;
@@ -3525,7 +3731,7 @@ get_live_memory_source(void)
 	}
 
 	if (crashbuiltin) {
-		pc->flags &= ~DEVMEM;
+		pc->flags &= ~(DEVMEM|PROC_KCORE);
 		pc->flags |= CRASHBUILTIN;
 		pc->readmem = read_memory_device;
 		pc->writemem = write_memory_device;
@@ -3786,15 +3992,69 @@ cleanup_memory_driver(void)
 	return errors ? FALSE : TRUE;
 }
 
+struct do_radix_tree_info {
+	ulong maxcount;
+	ulong count;
+	void *data;
+};
+static void do_radix_tree_count(ulong node, ulong slot, const char *path,
+				ulong index, void *private)
+{
+	struct do_radix_tree_info *info = private;
+	info->count++;
+}
+static void do_radix_tree_search(ulong node, ulong slot, const char *path,
+				 ulong index, void *private)
+{
+	struct do_radix_tree_info *info = private;
+	struct list_pair *rtp = info->data;
 
-/*
- *  Use the kernel's radix_tree_lookup() function as a template to dump
- *  a radix tree's entries. 
- */
+	if (rtp->index == index) {
+		rtp->value = (void *)slot;
+		info->count = 1;
+	}
+}
+static void do_radix_tree_dump(ulong node, ulong slot, const char *path,
+			       ulong index, void *private)
+{
+	struct do_radix_tree_info *info = private;
+	fprintf(fp, "[%ld] %lx\n", index, slot);
+	info->count++;
+}
+static void do_radix_tree_gather(ulong node, ulong slot, const char *path,
+				 ulong index, void *private)
+{
+	struct do_radix_tree_info *info = private;
+	struct list_pair *rtp = info->data;
 
-ulong RADIX_TREE_MAP_SHIFT = UNINITIALIZED;
-ulong RADIX_TREE_MAP_SIZE = UNINITIALIZED;
-ulong RADIX_TREE_MAP_MASK = UNINITIALIZED;
+	if (info->maxcount) {
+		rtp[info->count].index = index;
+		rtp[info->count].value = (void *)slot;
+
+		info->count++;
+		info->maxcount--;
+	}
+}
+static void do_radix_tree_dump_cb(ulong node, ulong slot, const char *path,
+				  ulong index, void *private)
+{
+	struct do_radix_tree_info *info = private;
+	struct list_pair *rtp = info->data;
+	int (*cb)(ulong) = rtp->value;
+
+	/* Caller defined operation */
+	if (!cb(slot)) {
+		if ((slot & RADIX_TREE_ENTRY_MASK) == RADIX_TREE_EXCEPTIONAL_ENTRY) {
+			if (CRASHDEBUG(1))
+				error(INFO, "RADIX_TREE_EXCEPTIONAL_ENTRY: %lx\n", slot); 
+			return;
+		}
+		error(FATAL, "do_radix_tree: callback "
+		      "operation failed: entry: %ld  item: %lx\n",
+		      info->count, slot);
+	}
+	info->count++;
+}
 
 /*
  *  do_radix_tree argument usage: 
@@ -3807,175 +4067,219 @@ ulong RADIX_TREE_MAP_MASK = UNINITIALIZED;
  *            return a count of 0. 
  *          RADIX_TREE_DUMP - Dump all existing index/value pairs.    
  *          RADIX_TREE_GATHER - Store all existing index/value pairs in the 
- *            passed-in array of radix_tree_pair structs starting at rtp, 
+ *            passed-in array of list_pair structs starting at rtp, 
  *            returning the count of entries stored; the caller can/should 
  *            limit the number of returned entries by putting the array size
  *            (max count) in the rtp->index field of the first structure 
  *            in the passed-in array.
+ *          RADIX_TREE_DUMP_CB - Similar with RADIX_TREE_DUMP, but for each
+ *            radix tree entry, a user defined callback at rtp->value will
+ *            be invoked.
  *
  *     rtp: Unused by RADIX_TREE_COUNT and RADIX_TREE_DUMP. 
- *          A pointer to a radix_tree_pair structure for RADIX_TREE_SEARCH.
- *          A pointer to an array of radix_tree_pair structures for
+ *          A pointer to a list_pair structure for RADIX_TREE_SEARCH.
+ *          A pointer to an array of list_pair structures for
  *          RADIX_TREE_GATHER; the dimension (max count) of the array may
  *          be stored in the index field of the first structure to avoid
  *          any chance of an overrun.
+ *          For RADIX_TREE_DUMP_CB, the rtp->value must be initialized as a
+ *          callback function.  The callback prototype must be: int (*)(ulong);
  */
 ulong
-do_radix_tree(ulong root, int flag, struct radix_tree_pair *rtp)
+do_radix_tree(ulong root, int flag, struct list_pair *rtp)
 {
-	int i, ilen, height; 
-	long nlen;
-	ulong index, maxindex, count, maxcount;
-	long *height_to_maxindex;
-	char *radix_tree_root_buf;
-	struct radix_tree_pair *r;
-	ulong root_rnode;
-	void *ret;
-
-	count = 0;
-
-	if (!VALID_STRUCT(radix_tree_root) || !VALID_STRUCT(radix_tree_node) ||
-	    !VALID_MEMBER(radix_tree_root_height) ||
-	    !VALID_MEMBER(radix_tree_root_rnode) ||
-	    !VALID_MEMBER(radix_tree_node_slots) ||
-	    !ARRAY_LENGTH(height_to_maxindex)) 
-		error(FATAL, 
-		   "radix trees do not exist (or have changed their format)\n");
-
-	if (RADIX_TREE_MAP_SHIFT == UNINITIALIZED) {
-		if (!(nlen = MEMBER_SIZE("radix_tree_node", "slots")))
-			error(FATAL, "cannot determine length of " 
-				     "radix_tree_node.slots[] array\n");
-		nlen /= sizeof(void *);
-		RADIX_TREE_MAP_SHIFT = ffsl(nlen) - 1;
-		RADIX_TREE_MAP_SIZE = (1UL << RADIX_TREE_MAP_SHIFT);
-		RADIX_TREE_MAP_MASK = (RADIX_TREE_MAP_SIZE-1);
-	}
-
-	ilen = ARRAY_LENGTH(height_to_maxindex);
-	height_to_maxindex = (long *)GETBUF(ilen * sizeof(long));
-	readmem(symbol_value("height_to_maxindex"), KVADDR, 
-	    	height_to_maxindex, ilen*sizeof(long),
-		"height_to_maxindex array", FAULT_ON_ERROR);
-
-	if (CRASHDEBUG(1)) {
-		fprintf(fp, "radix_tree_node.slots[%ld]\n", 
-			RADIX_TREE_MAP_SIZE);
-		fprintf(fp, "height_to_maxindex[%d]: ", ilen);
-		for (i = 0; i < ilen; i++)
-			fprintf(fp, "%lu ", height_to_maxindex[i]);
-		fprintf(fp, "\n");
-		fprintf(fp, "radix_tree_root at %lx:\n", root);
-		dump_struct("radix_tree_root", (ulong)root, RADIX(16));
-	}
-
-	radix_tree_root_buf = GETBUF(SIZE(radix_tree_root));
-	readmem(root, KVADDR, radix_tree_root_buf, SIZE(radix_tree_root),
-		"radix_tree_root", FAULT_ON_ERROR);
-	height = UINT(radix_tree_root_buf + OFFSET(radix_tree_root_height));
-
-	if (height > ilen) {
-		fprintf(fp, "radix_tree_root at %lx:\n", root);
-		dump_struct("radix_tree_root", (ulong)root, RADIX(16));
-		error(FATAL, 
-                   "height %d is greater than height_to_maxindex[] index %ld\n",
-			height, ilen);
-	}
-	
-	maxindex = height_to_maxindex[height];
-	FREEBUF(height_to_maxindex);
-	FREEBUF(radix_tree_root_buf);
-
-	root_rnode = root + OFFSET(radix_tree_root_rnode);
+	struct do_radix_tree_info info = {
+		.count		= 0,
+		.data		= rtp,
+	};
+	struct radix_tree_ops ops = {
+		.radix		= 16,
+		.private	= &info,
+	};
 
 	switch (flag)
 	{
 	case RADIX_TREE_COUNT:
-		for (index = count = 0; index <= maxindex; index++) {
-			if (radix_tree_lookup(root_rnode, index, height))
-				count++;
-		}
+		ops.entry = do_radix_tree_count;
 		break;
 
 	case RADIX_TREE_SEARCH:
-		count = 0;
-		if (rtp->index > maxindex) 
-			break;
-
-		if ((ret = radix_tree_lookup(root_rnode, rtp->index, height))) {
-			rtp->value = ret;
-			count++;
-		}
+		/*
+		 * FIXME: do_radix_tree_traverse() traverses whole
+		 * radix tree, not binary search. So this search is
+		 * not efficient.
+		 */
+		ops.entry = do_radix_tree_search;
 		break;
 
 	case RADIX_TREE_DUMP:
-		for (index = count = 0; index <= maxindex; index++) {
-			if ((ret = 
-			    radix_tree_lookup(root_rnode, index, height))) {
-				fprintf(fp, "[%ld] %lx\n", index, (ulong)ret);
-				count++;
-			}
-		}
+		ops.entry = do_radix_tree_dump;
 		break;
 
 	case RADIX_TREE_GATHER:
-		if (!(maxcount = rtp->index))
-			maxcount = (ulong)(-1);   /* caller beware */
+		if (!(info.maxcount = rtp->index))
+			info.maxcount = (ulong)(-1);   /* caller beware */
 
-                for (index = count = 0, r = rtp; index <= maxindex; index++) {
-                        if ((ret = 
-			    radix_tree_lookup(root_rnode, index, height))) {
-				r->index = index;
-				r->value = ret;
-				count++;
-                                if (--maxcount <= 0)
-					break;
-				r++;
-                        }
-                }
+		ops.entry = do_radix_tree_gather;
+		break;
+
+	case RADIX_TREE_DUMP_CB:
+		if (rtp->value == NULL) {
+			error(FATAL, "do_radix_tree: need set callback function");
+			return -EINVAL;
+		}
+		ops.entry = do_radix_tree_dump_cb;
 		break;
 
 	default:
 		error(FATAL, "do_radix_tree: invalid flag: %lx\n", flag);
 	}
 
-	return count;
+	do_radix_tree_traverse(root, 1, &ops);
+	return info.count;
 }
 
-static void *
-radix_tree_lookup(ulong root_rnode, ulong index, int height)
+
+struct do_xarray_info {
+	ulong maxcount;
+	ulong count;
+	void *data;
+};
+static void do_xarray_count(ulong node, ulong slot, const char *path,
+				ulong index, void *private)
 {
-	unsigned int shift;
-	ulong rnode;
-	ulong *slots;
+	struct do_xarray_info *info = private;
+	info->count++;
+}
+static void do_xarray_search(ulong node, ulong slot, const char *path,
+				 ulong index, void *private)
+{
+	struct do_xarray_info *info = private;
+	struct list_pair *xp = info->data;
 
-	shift = (height-1) * RADIX_TREE_MAP_SHIFT;
+	if (xp->index == index) {
+		xp->value = (void *)slot;
+		info->count = 1;
+	}
+}
+static void do_xarray_dump(ulong node, ulong slot, const char *path,
+			       ulong index, void *private)
+{
+	struct do_xarray_info *info = private;
+	fprintf(fp, "[%ld] %lx\n", index, slot);
+	info->count++;
+}
+static void do_xarray_gather(ulong node, ulong slot, const char *path,
+				 ulong index, void *private)
+{
+	struct do_xarray_info *info = private;
+	struct list_pair *xp = info->data;
 
-	readmem(root_rnode, KVADDR, &rnode, sizeof(void *),
-		"radix_tree_root rnode", FAULT_ON_ERROR);
+	if (info->maxcount) {
+		xp[info->count].index = index;
+		xp[info->count].value = (void *)slot;
 
-	if (rnode & 1)
-		rnode &= ~1;
+		info->count++;
+		info->maxcount--;
+	}
+}
+static void do_xarray_dump_cb(ulong node, ulong slot, const char *path,
+				  ulong index, void *private)
+{
+	struct do_xarray_info *info = private;
+	struct list_pair *xp = info->data;
+	int (*cb)(ulong) = xp->value;
 
-	slots = (ulong *)GETBUF(sizeof(void *) * RADIX_TREE_MAP_SIZE);
+	/* Caller defined operation */
+	if (!cb(slot)) {
+		if (slot & XARRAY_TAG_MASK) {
+			if (CRASHDEBUG(0))
+				error(INFO, "entry has XARRAY_TAG_MASK bits set: %lx\n", slot); 
+			return;
+		}
+		error(FATAL, "do_xarray: callback "
+		      "operation failed: entry: %ld  item: %lx\n",
+		      info->count, slot);
+	}
+	info->count++;
+}
 
-	while (height > 0) {
-		if (rnode == 0)
-			break;
+/*
+ *  do_xarray argument usage: 
+ *
+ *    root: Address of a xarray structure
+ *
+ *    flag: XARRAY_COUNT - Return the number of entries in the tree.   
+ *          XARRAY_SEARCH - Search for an entry at xp->index; if found,
+ *            store the entry in xp->value and return a count of 1; otherwise
+ *            return a count of 0. 
+ *          XARRY_DUMP - Dump all existing index/value pairs.    
+ *          XARRAY_GATHER - Store all existing index/value pairs in the 
+ *            passed-in array of list_pair structs starting at xp, 
+ *            returning the count of entries stored; the caller can/should 
+ *            limit the number of returned entries by putting the array size
+ *            (max count) in the xp->index field of the first structure 
+ *            in the passed-in array.
+ *          XARRAY_DUMP_CB - Similar with XARRAY_DUMP, but for each
+ *            xarray entry, a user defined callback at xp->value will
+ *            be invoked.
+ *
+ *      xp: Unused by XARRAY_COUNT and XARRAY_DUMP. 
+ *          A pointer to a list_pair structure for XARRAY_SEARCH.
+ *          A pointer to an array of list_pair structures for
+ *          XARRAY_GATHER; the dimension (max count) of the array may
+ *          be stored in the index field of the first structure to avoid
+ *          any chance of an overrun.
+ *          For XARRAY_DUMP_CB, the rtp->value must be initialized as a
+ *          callback function.  The callback prototype must be: int (*)(ulong);
+ */
+ulong
+do_xarray(ulong root, int flag, struct list_pair *xp)
+{
+	struct do_xarray_info info = {
+		.count		= 0,
+		.data		= xp,
+	};
+	struct xarray_ops ops = {
+		.radix		= 16,
+		.private	= &info,
+	};
 
-		readmem((ulong)rnode+OFFSET(radix_tree_node_slots), KVADDR, 
-			&slots[0], sizeof(void *) * RADIX_TREE_MAP_SIZE,
-			"radix_tree_node.slots array", FAULT_ON_ERROR);
+	switch (flag)
+	{
+	case XARRAY_COUNT:
+		ops.entry = do_xarray_count;
+		break;
 
-		rnode = slots[((index >> shift) & RADIX_TREE_MAP_MASK)];
+	case XARRAY_SEARCH:
+		ops.entry = do_xarray_search;
+		break;
 
-		shift -= RADIX_TREE_MAP_SHIFT;
-		height--;
+	case XARRAY_DUMP:
+		ops.entry = do_xarray_dump;
+		break;
+
+	case XARRAY_GATHER:
+		if (!(info.maxcount = xp->index))
+			info.maxcount = (ulong)(-1);   /* caller beware */
+
+		ops.entry = do_xarray_gather;
+		break;
+
+	case XARRAY_DUMP_CB:
+		if (xp->value == NULL) {
+			error(FATAL, "do_xarray: no callback function specified");
+			return -EINVAL;
+		}
+		ops.entry = do_xarray_dump_cb;
+		break;
+
+	default:
+		error(FATAL, "do_xarray: invalid flag: %lx\n", flag);
 	}
 
-	FREEBUF(slots);
-
-	return (void *)rnode;
+	do_xarray_traverse(root, 1, &ops);
+	return info.count;
 }
 
 int
@@ -4079,4 +4383,31 @@ get_root_vfsmount(char *file_buf)
 	}
 
 	return vfsmnt;
+}
+
+void
+check_live_arch_mismatch(void)
+{
+	struct utsname utsname;
+
+	if (machine_type("X86") && (uname(&utsname) == 0) &&
+	    STRNEQ(utsname.machine, "x86_64"))
+                error(FATAL, "compiled for the X86 architecture\n");
+
+#if defined(__i386__) || defined(__x86_64__) 
+	if (machine_type("ARM"))
+		error(FATAL, "compiled for the ARM architecture\n");
+#endif
+#ifdef __x86_64__
+	if (machine_type("ARM64"))
+		error(FATAL, "compiled for the ARM64 architecture\n");
+#endif
+#ifdef __x86_64__ 
+	if (machine_type("PPC64"))
+		error(FATAL, "compiled for the PPC64 architecture\n");
+#endif
+#ifdef __powerpc64__
+	if (machine_type("PPC"))
+		error(FATAL, "compiled for the PPC architecture\n");
+#endif
 }

@@ -1,8 +1,8 @@
 /* x86.c - core analysis suite
  *
  * Portions Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
- * Copyright (C) 2002-2013 David Anderson
- * Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2002-2014,2017-2018 David Anderson
+ * Copyright (C) 2002-2014,2017-2018 Red Hat, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -178,6 +178,7 @@ static void db_symbol_values(db_sym_t, char **, db_expr_t *);
 static int db_sym_numargs(db_sym_t, int *, char **);
 static void x86_dump_line_number(ulong);
 static void x86_clear_machdep_cache(void);
+static void x86_parse_cmdline_args(void);
 
 static ulong mach_debug = 0;
 
@@ -1581,6 +1582,9 @@ x86_eframe_search(struct bt_info *bt_in)
 
         	for (c = 0; c < NR_CPUS; c++) {
                 	if (tt->hardirq_ctx[c]) {
+				if ((bt->flags & BT_CPUMASK) && 
+				    !(NUM_IN_BITMAP(bt->cpumask, c)))
+					continue;
 				bt->hp->esp = tt->hardirq_ctx[c];
 				fprintf(fp, "CPU %d HARD IRQ STACK:\n", c);
 				if ((cnt = x86_eframe_search(bt)))
@@ -1591,6 +1595,9 @@ x86_eframe_search(struct bt_info *bt_in)
 		}
         	for (c = 0; c < NR_CPUS; c++) {
 			if (tt->softirq_ctx[c]) {
+				if ((bt->flags & BT_CPUMASK) && 
+				    !(NUM_IN_BITMAP(bt->cpumask, c)))
+					continue;
 				bt->hp->esp = tt->softirq_ctx[c];
 				fprintf(fp, "CPU %d SOFT IRQ STACK:\n", c);
 				if ((cnt = x86_eframe_search(bt)))
@@ -1768,6 +1775,7 @@ x86_init(int when)
 		machdep->last_ptbl_read = 0;
 		machdep->machspec = &x86_machine_specific;
 		machdep->verify_paddr = generic_verify_paddr;
+		x86_parse_cmdline_args();
 		break;
 
 	case PRE_GDB:
@@ -1791,7 +1799,12 @@ x86_init(int when)
 			machdep->pmd = machdep->pgd;   
 		}
 		machdep->ptrs_per_pgd = PTRS_PER_PGD;
-	        machdep->kvbase = symbol_value("_stext") & ~KVBASE_MASK;  
+		if (!machdep->kvbase) {
+			if (kernel_symbol_exists("module_kaslr_mutex"))
+				machdep->kvbase = 0xc0000000;
+			else
+				machdep->kvbase = symbol_value("_stext") & ~KVBASE_MASK;  
+		}
 		if (machdep->kvbase & 0x80000000) 
                 	machdep->is_uvaddr = generic_is_uvaddr;
 		else {
@@ -1954,13 +1967,27 @@ x86_init(int when)
 		}
 		MEMBER_OFFSET_INIT(thread_struct_cr3, "thread_struct", "cr3");
 		STRUCT_SIZE_INIT(cpuinfo_x86, "cpuinfo_x86");
-		STRUCT_SIZE_INIT(e820map, "e820map");
-		STRUCT_SIZE_INIT(e820entry, "e820entry");
 		STRUCT_SIZE_INIT(irq_ctx, "irq_ctx");
-		MEMBER_OFFSET_INIT(e820map_nr_map, "e820map", "nr_map");
-		MEMBER_OFFSET_INIT(e820entry_addr, "e820entry", "addr");
-		MEMBER_OFFSET_INIT(e820entry_size, "e820entry", "size");
-		MEMBER_OFFSET_INIT(e820entry_type, "e820entry", "type");
+		if (STRUCT_EXISTS("e820map")) {
+			STRUCT_SIZE_INIT(e820map, "e820map");
+			MEMBER_OFFSET_INIT(e820map_nr_map, "e820map", "nr_map");
+		} else {
+			STRUCT_SIZE_INIT(e820map, "e820_table");
+			MEMBER_OFFSET_INIT(e820map_nr_map, "e820_table", "nr_entries");
+		}
+		if (STRUCT_EXISTS("e820entry")) {
+			STRUCT_SIZE_INIT(e820entry, "e820entry");
+			MEMBER_OFFSET_INIT(e820entry_addr, "e820entry", "addr");
+			MEMBER_OFFSET_INIT(e820entry_size, "e820entry", "size");
+			MEMBER_OFFSET_INIT(e820entry_type, "e820entry", "type");
+		} else {
+			STRUCT_SIZE_INIT(e820entry, "e820_entry");
+			MEMBER_OFFSET_INIT(e820entry_addr, "e820_entry", "addr");
+			MEMBER_OFFSET_INIT(e820entry_size, "e820_entry", "size");
+			MEMBER_OFFSET_INIT(e820entry_type, "e820_entry", "type");
+		}
+		if (!VALID_STRUCT(irq_ctx))
+			STRUCT_SIZE_INIT(irq_ctx, "irq_stack");
 		if (KVMDUMP_DUMPFILE())
 			set_kvm_iohole(NULL);
 		if (symbol_exists("irq_desc"))
@@ -2025,6 +2052,8 @@ x86_init(int when)
 		if (!remap_init())
 			machdep->machspec->max_numnodes = -1;
 
+		MEMBER_OFFSET_INIT(inactive_task_frame_ret_addr, 
+			"inactive_task_frame", "ret_addr");
 		break;
 
 	case POST_INIT:
@@ -2034,6 +2063,63 @@ x86_init(int when)
 	case LOG_ONLY:
 		machdep->kvbase = kt->vmcoreinfo._stext_SYMBOL & ~KVBASE_MASK;
 		break;
+	}
+}
+
+/*
+ *  Handle non-default (c0000000) values of CONFIG_PAGE_OFFSET 
+ *  with "--machdep page_offset=<address>"
+ */
+static void
+x86_parse_cmdline_args(void)
+{
+	int index, i, c, err;
+	char *arglist[MAXARGS];
+	char buf[BUFSIZE];
+	char *p;
+	ulong value = 0;
+
+	for (index = 0; index < MAX_MACHDEP_ARGS; index++) {
+		if (!machdep->cmdline_args[index])
+			break;
+
+		if (!strstr(machdep->cmdline_args[index], "=")) {
+			error(WARNING, "ignoring --machdep option: %x\n",
+				machdep->cmdline_args[index]);
+			continue;
+		}
+
+		strcpy(buf, machdep->cmdline_args[index]);
+
+		for (p = buf; *p; p++) {
+			if (*p == ',')
+				*p = ' ';
+		}
+
+		c = parse_line(buf, arglist);
+
+		for (i = 0; i < c; i++) {
+			err = 0;
+
+			if (STRNEQ(arglist[i], "page_offset=")) {
+				int flags = RETURN_ON_ERROR | QUIET;
+
+				p = arglist[i] + strlen("page_offset=");
+				if (strlen(p))
+					value = htol(p, flags, &err);
+
+				if (!err) {
+					machdep->kvbase = value;
+
+					error(NOTE, "setting PAGE_OFFSET to: 0x%lx\n\n",
+						machdep->kvbase);
+					continue;
+				}
+			}
+
+			error(WARNING, "ignoring --machdep option: %s\n",
+				arglist[i]);
+		}
 	}
 }
 
@@ -3634,12 +3720,22 @@ static ulong
 x86_get_pc(struct bt_info *bt)
 {
 	ulong offset;
-	ulong eip;
+	ulong eip, inactive_task_frame;
 
 	if (tt->flags & THREAD_INFO) {
-        	readmem(bt->task + OFFSET(task_struct_thread_eip), KVADDR,
-                	&eip, sizeof(void *), 
-			"thread_struct eip", FAULT_ON_ERROR);
+		if (VALID_MEMBER(task_struct_thread_eip))
+			readmem(bt->task + OFFSET(task_struct_thread_eip), KVADDR,
+				&eip, sizeof(void *), 
+				"thread_struct eip", FAULT_ON_ERROR);
+		else if (VALID_MEMBER(inactive_task_frame_ret_addr)) {
+			readmem(bt->task + OFFSET(task_struct_thread_esp), KVADDR,
+				&inactive_task_frame, sizeof(void *),
+				"task_struct.inactive_task_frame", FAULT_ON_ERROR);
+			readmem(inactive_task_frame + OFFSET(inactive_task_frame_ret_addr), 
+				KVADDR, &eip, sizeof(void *),
+				"inactive_task_frame.ret_addr", FAULT_ON_ERROR);
+		} else
+			error(FATAL, "cannot determine ip address\n");
 		return eip;
 	}
 
@@ -3664,6 +3760,8 @@ x86_get_sp(struct bt_info *bt)
                 readmem(bt->task + OFFSET(task_struct_thread_esp), KVADDR,
                         &ksp, sizeof(void *),
                         "thread_struct esp", FAULT_ON_ERROR);
+		if (VALID_MEMBER(inactive_task_frame_ret_addr))
+			ksp += OFFSET(inactive_task_frame_ret_addr);
                 return ksp;
 	} 
 
@@ -4329,33 +4427,54 @@ static char *e820type[] = {
 static void
 x86_display_memmap(void)
 {
-	ulong e820;
-	int nr_map, i;
-	char *buf, *e820entry_ptr;
-	ulonglong addr, size;
-	ulong type;
+        ulong e820;
+        int nr_map, i;
+        char *buf, *e820entry_ptr;
+        ulonglong addr, size;
+        uint type;
 
-	e820 = symbol_value("e820");
-	buf = (char *)GETBUF(SIZE(e820map));
-
-        readmem(e820, KVADDR, &buf[0], SIZE(e820map), 
-		"e820map", FAULT_ON_ERROR);
-
-	nr_map = INT(buf + OFFSET(e820map_nr_map));
-
-	fprintf(fp, "      PHYSICAL ADDRESS RANGE         TYPE\n");
-
-	for (i = 0; i < nr_map; i++) {
-		e820entry_ptr = buf + sizeof(int) + (SIZE(e820entry) * i);
-		addr = ULONGLONG(e820entry_ptr + OFFSET(e820entry_addr));
-		size = ULONGLONG(e820entry_ptr + OFFSET(e820entry_size));
-		type = ULONG(e820entry_ptr + OFFSET(e820entry_type));
-		fprintf(fp, "%016llx - %016llx  ", addr, addr+size);
-		if (type >= (sizeof(e820type)/sizeof(char *)))
-			fprintf(fp, "type %ld\n", type);
+	if (kernel_symbol_exists("e820")) {
+		if (get_symbol_type("e820", NULL, NULL) == TYPE_CODE_PTR)
+			get_symbol_data("e820", sizeof(void *), &e820);
 		else
-			fprintf(fp, "%s\n", e820type[type]);
+			e820 = symbol_value("e820");
+
+	} else if (kernel_symbol_exists("e820_table"))
+		get_symbol_data("e820_table", sizeof(void *), &e820);
+	else
+		error(FATAL, "neither e820 or e820_table symbols exist\n");
+
+	if (CRASHDEBUG(1)) {
+		if (STRUCT_EXISTS("e820map"))
+			dump_struct("e820map", e820, RADIX(16));
+		else if (STRUCT_EXISTS("e820_table"))
+			dump_struct("e820_table", e820, RADIX(16));
 	}
+        buf = (char *)GETBUF(SIZE(e820map));
+
+        readmem(e820, KVADDR, &buf[0], SIZE(e820map),
+                "e820map", FAULT_ON_ERROR);
+
+        nr_map = INT(buf + OFFSET(e820map_nr_map));
+
+        fprintf(fp, "      PHYSICAL ADDRESS RANGE         TYPE\n");
+
+        for (i = 0; i < nr_map; i++) {
+                e820entry_ptr = buf + sizeof(int) + (SIZE(e820entry) * i);
+                addr = ULONGLONG(e820entry_ptr + OFFSET(e820entry_addr));
+                size = ULONGLONG(e820entry_ptr + OFFSET(e820entry_size));
+                type = UINT(e820entry_ptr + OFFSET(e820entry_type));
+		fprintf(fp, "%016llx - %016llx  ", addr, addr+size);
+		if (type >= (sizeof(e820type)/sizeof(char *))) {
+			if (type == 12)
+				fprintf(fp, "E820_PRAM\n");
+			else if (type == 128)
+				fprintf(fp, "E820_RESERVED_KERN\n");
+			else
+				fprintf(fp, "type %d\n", type);
+		} else
+			fprintf(fp, "%s\n", e820type[type]);
+        }
 }
 
 /*
@@ -4513,6 +4632,7 @@ xen_m2p_nonPAE(ulong machine)
 }
 
 #include "netdump.h"
+#include "xen_dom0.h"
 
 /*
  *  From the xen vmcore, create an index of mfns for each page that makes 
@@ -4534,12 +4654,11 @@ x86_xen_kdump_p2m_create(struct xen_kdump_data *xkd)
 	int mfns[MAX_X86_FRAMES] = { 0 };
 
 	/*
-	 *  Temporarily read physical (machine) addresses from vmcore by
-	 *  going directly to read_netdump() instead of via read_kdump().
+	 *  Temporarily read physical (machine) addresses from vmcore.
 	 */ 
-	pc->readmem = read_netdump;
+	pc->curcmd_flags |= XEN_MACHINE_ADDR;
 	if (CRASHDEBUG(1)) 
-		fprintf(fp, "readmem (temporary): read_netdump()\n");
+		fprintf(fp, "readmem (temporary): force XEN_MACHINE_ADDR\n");
 
 	if (xkd->flags & KDUMP_CR3)
 		goto use_cr3;
@@ -4616,9 +4735,9 @@ x86_xen_kdump_p2m_create(struct xen_kdump_data *xkd)
                 fprintf(fp, "\n");
         }
 
-	pc->readmem = read_kdump;
+	pc->curcmd_flags &= ~XEN_MACHINE_ADDR;
 	if (CRASHDEBUG(1)) 
-		fprintf(fp, "readmem (restore): read_kdump()\n");
+		fprintf(fp, "readmem (restore): p2m translation\n");
 
 	return TRUE;
 
@@ -4707,9 +4826,9 @@ use_cr3:
         machdep->last_ptbl_read = 0;
         machdep->last_pmd_read = 0;
         machdep->last_pgd_read = 0;
-	pc->readmem = read_kdump;
+	pc->curcmd_flags &= ~XEN_MACHINE_ADDR;
 	if (CRASHDEBUG(1)) 
-		fprintf(fp, "readmem (restore): read_kdump()\n");
+		fprintf(fp, "readmem (restore): p2m translation\n");
 
 	return TRUE;
 }
@@ -4897,7 +5016,7 @@ x86_xendump_p2m_create(struct xendump_data *xd)
 		    "MEMBER_OFFSET(vcpu_guest_context, ctrlreg): %ld\n",
 			ctrlreg_offset);
 
-	offset = (off_t)xd->xc_core.header.xch_ctxt_offset + 
+	offset = xd->xc_core.header.xch_ctxt_offset +
 		(off_t)ctrlreg_offset;
 
 	if (lseek(xd->xfd, offset, SEEK_SET) == -1)
@@ -4997,7 +5116,7 @@ x86_pvops_xendump_p2m_create(struct xendump_data *xd)
 		    "MEMBER_OFFSET(vcpu_guest_context, ctrlreg): %ld\n",
 			ctrlreg_offset);
 
-	offset = (off_t)xd->xc_core.header.xch_ctxt_offset + 
+	offset = xd->xc_core.header.xch_ctxt_offset +
 		(off_t)ctrlreg_offset;
 
 	if (lseek(xd->xfd, offset, SEEK_SET) == -1)
@@ -5369,7 +5488,7 @@ x86_xendump_panic_task(struct xendump_data *xd)
 	    INVALID_MEMBER(cpu_user_regs_esp))
 		return NO_TASK;
 
-        offset = (off_t)xd->xc_core.header.xch_ctxt_offset +
+        offset = xd->xc_core.header.xch_ctxt_offset +
                 (off_t)OFFSET(vcpu_guest_context_user_regs) +
 		(off_t)OFFSET(cpu_user_regs_esp);
 
@@ -5419,7 +5538,7 @@ x86_get_xendump_regs(struct xendump_data *xd, struct bt_info *bt, ulong *eip, ul
             INVALID_MEMBER(cpu_user_regs_esp))
                 goto generic;
 
-        offset = (off_t)xd->xc_core.header.xch_ctxt_offset +
+        offset = xd->xc_core.header.xch_ctxt_offset +
                 (off_t)OFFSET(vcpu_guest_context_user_regs) +
                 (off_t)OFFSET(cpu_user_regs_esp);
         if (lseek(xd->xfd, offset, SEEK_SET) == -1)
@@ -5427,7 +5546,7 @@ x86_get_xendump_regs(struct xendump_data *xd, struct bt_info *bt, ulong *eip, ul
         if (read(xd->xfd, &xesp, sizeof(ulong)) != sizeof(ulong))
                 goto generic;
 
-        offset = (off_t)xd->xc_core.header.xch_ctxt_offset +
+        offset = xd->xc_core.header.xch_ctxt_offset +
                 (off_t)OFFSET(vcpu_guest_context_user_regs) +
                 (off_t)OFFSET(cpu_user_regs_eip);
         if (lseek(xd->xfd, offset, SEEK_SET) == -1)

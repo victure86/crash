@@ -3,8 +3,8 @@
 # Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
 #       www.missioncriticallinux.com, info@missioncriticallinux.com
 #
-# Copyright (C) 2002-2013 David Anderson
-# Copyright (C) 2002-2013 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2002-2016 David Anderson
+# Copyright (C) 2002-2016 Red Hat, Inc. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,7 +20,7 @@
 PROGRAM=crash
 
 #
-# Supported targets: X86 ALPHA PPC IA64 PPC64
+# Supported targets: X86 ALPHA PPC IA64 PPC64 SPARC64
 # TARGET and GDB_CONF_FLAGS will be configured automatically by configure
 #
 TARGET=
@@ -47,7 +47,7 @@ INSTALLDIR=${DESTDIR}/usr/bin
 # LDFLAGS will be configured automatically by configure
 LDFLAGS=
 
-GENERIC_HFILES=defs.h xen_hyper_defs.h
+GENERIC_HFILES=defs.h xen_hyper_defs.h xen_dom0.h
 MCORE_HFILES=va_server.h vas_crash.h
 REDHAT_HFILES=netdump.h diskdump.h makedumpfile.h xendump.h kvmdump.h qemu-load.h
 LKCD_DUMP_HFILES=lkcd_vmdump_v1.h lkcd_vmdump_v2_v3.h lkcd_dump_v5.h \
@@ -57,35 +57,40 @@ LKCD_TRACE_HFILES=lkcd_x86_trace.h
 IBM_HFILES=ibm_common.h
 SADUMP_HFILES=sadump.h
 UNWIND_HFILES=unwind.h unwind_i.h rse.h unwind_x86.h unwind_x86_64.h
+VMWARE_HFILES=vmware_vmss.h
 
 CFILES=main.c tools.c global_data.c memory.c filesys.c help.c task.c \
-	kernel.c test.c gdb_interface.c configure.c net.c dev.c \
+	kernel.c test.c gdb_interface.c configure.c net.c dev.c bpf.c \
 	alpha.c x86.c ppc.c ia64.c s390.c s390x.c s390dbf.c ppc64.c x86_64.c \
-	arm.c arm64.c \
+	arm.c arm64.c mips.c sparc64.c \
 	extensions.c remote.c va_server.c va_server_v1.c symbols.c cmdline.c \
 	lkcd_common.c lkcd_v1.c lkcd_v2_v3.c lkcd_v5.c lkcd_v7.c lkcd_v8.c\
 	lkcd_fix_mem.c s390_dump.c lkcd_x86_trace.c \
 	netdump.c diskdump.c makedumpfile.c xendump.c unwind.c unwind_decoder.c \
 	unwind_x86_32_64.c unwind_arm.c \
 	xen_hyper.c xen_hyper_command.c xen_hyper_global_data.c \
-	xen_hyper_dump_tables.c kvmdump.c qemu.c qemu-load.c sadump.c ipcs.c
+	xen_hyper_dump_tables.c kvmdump.c qemu.c qemu-load.c sadump.c ipcs.c \
+	ramdump.c vmware_vmss.c \
+	xen_dom0.c kaslr_helper.c
 
 SOURCE_FILES=${CFILES} ${GENERIC_HFILES} ${MCORE_HFILES} \
 	${REDHAT_CFILES} ${REDHAT_HFILES} ${UNWIND_HFILES} \
 	${LKCD_DUMP_HFILES} ${LKCD_TRACE_HFILES} ${LKCD_OBSOLETE_HFILES}\
-	${IBM_HFILES} ${SADUMP_HFILES}
+	${IBM_HFILES} ${SADUMP_HFILES} ${VMWARE_HFILES}
 
 OBJECT_FILES=main.o tools.o global_data.o memory.o filesys.o help.o task.o \
-	build_data.o kernel.o test.o gdb_interface.o net.o dev.o \
+	build_data.o kernel.o test.o gdb_interface.o net.o dev.o bpf.o \
 	alpha.o x86.o ppc.o ia64.o s390.o s390x.o s390dbf.o ppc64.o x86_64.o \
-	arm.o arm64.o \
+	arm.o arm64.o mips.o sparc64.o \
 	extensions.o remote.o va_server.o va_server_v1.o symbols.o cmdline.o \
 	lkcd_common.o lkcd_v1.o lkcd_v2_v3.o lkcd_v5.o lkcd_v7.o lkcd_v8.o \
 	lkcd_fix_mem.o s390_dump.o netdump.o diskdump.o makedumpfile.o xendump.o \
 	lkcd_x86_trace.o unwind_v1.o unwind_v2.o unwind_v3.o \
 	unwind_x86_32_64.o unwind_arm.o \
 	xen_hyper.o xen_hyper_command.o xen_hyper_global_data.o \
-	xen_hyper_dump_tables.o kvmdump.o qemu.o qemu-load.o sadump.o ipcs.o
+	xen_hyper_dump_tables.o kvmdump.o qemu.o qemu-load.o sadump.o ipcs.o \
+	ramdump.o vmware_vmss.o \
+	xen_dom0.o kaslr_helper.o
 
 MEMORY_DRIVER_FILES=memory_driver/Makefile memory_driver/crash.c memory_driver/README
 
@@ -228,17 +233,28 @@ gdb_merge: force
 	@rm -f ${PROGRAM}
 	@if [ ! -f ${GDB}/config.status ]; then \
 	  (cd ${GDB}; ./configure ${GDB_CONF_FLAGS} --with-separate-debug-dir=/usr/lib/debug \
-	    --with-bugurl="" --with-expat=no --with-python=no; \
+	    --with-bugurl="" --with-expat=no --with-python=no --disable-sim; \
 	  make --no-print-directory CRASH_TARGET=${TARGET}; echo ${TARGET} > crash.target) \
-	else (cd ${GDB}/gdb; make --no-print-directory CRASH_TARGET=${TARGET};); fi
+	else make --no-print-directory rebuild; fi
 	@if [ ! -f ${PROGRAM} ]; then \
 	  echo; echo "${PROGRAM} build failed"; \
 	  echo; exit 1; fi
+
+rebuild:
+	@if [ ! -f ${GDB}/${GDB}.patch ]; then \
+	  touch ${GDB}/${GDB}.patch; fi
+	@if [ -f ${GDB}.patch ] && [ -s ${GDB}.patch ] && \
+	  [ "`sum ${GDB}.patch`" != "`sum ${GDB}/${GDB}.patch`" ]; then \
+	  (patch -N -p0 -r- --fuzz=0 < ${GDB}.patch; cp ${GDB}.patch ${GDB}; cd ${GDB}; \
+	  make --no-print-directory CRASH_TARGET=${TARGET}) \
+	else (cd ${GDB}/gdb; make --no-print-directory CRASH_TARGET=${TARGET}); fi
 
 gdb_unzip:
 	@rm -f gdb.files
 	@for FILE in ${GDB_FILES} dummy; do\
 	  echo $$FILE >> gdb.files; done
+	@if [ ! -f ${GDB}.tar.gz ] && [ ! -f /usr/bin/wget ]; then \
+	  echo /usr/bin/wget is required to download ${GDB}.tar.gz; echo; exit 1; fi
 	@if [ ! -f ${GDB}.tar.gz ] && [ -f /usr/bin/wget ]; then \
 	  wget http://ftp.gnu.org/gnu/gdb/${GDB}.tar.gz; fi
 	@tar --exclude-from gdb.files -xvzmf ${GDB}.tar.gz
@@ -246,7 +262,19 @@ gdb_unzip:
 
 gdb_patch:
 	if [ -f ${GDB}.patch ] && [ -s ${GDB}.patch ]; then \
-		patch -p0 < ${GDB}.patch; fi
+		patch -p0 < ${GDB}.patch; cp ${GDB}.patch ${GDB}; fi
+	if [ "${ARCH}" = "ppc64le" ] && [ -f ${GDB}-ppc64le-support.patch ]; then \
+		patch -d ${GDB} -p1 -F0 < ${GDB}-ppc64le-support.patch ; \
+	fi
+	if [ "${ARCH}" = "x86_64" ] && [ "${TARGET}" = "PPC64" ] && [ -f ${GDB}-ppc64le-support.patch ]; then \
+		patch -d ${GDB} -p1 -F0 < ${GDB}-ppc64le-support.patch ; \
+	fi
+	if [ -f /usr/include/proc_service.h ]; then \
+		grep 'extern ps_err_e ps_get_thread_area (struct' /usr/include/proc_service.h; \
+		if [ $$? -eq 0 ]; then \
+			patch -p0 < ${GDB}-proc_service.h.patch; \
+		fi; \
+	fi
 
 library: make_build_data ${OBJECT_FILES}
 	ar -rs ${PROGRAM}lib.a ${OBJECT_FILES}
@@ -397,6 +425,12 @@ arm.o: ${GENERIC_HFILES} ${REDHAT_HFILES} arm.c
 arm64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} arm64.c
 	${CC} -c ${CRASH_CFLAGS} arm64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
+mips.o: ${GENERIC_HFILES} ${REDHAT_HFILES} mips.c
+	${CC} -c ${CRASH_CFLAGS} mips.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+sparc64.o: ${GENERIC_HFILES} ${REDHAT_HFILES} sparc64.c
+	${CC} -c ${CRASH_CFLAGS} sparc64.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
 s390.o: ${GENERIC_HFILES} ${IBM_HFILES} s390.c
 	${CC} -c ${CRASH_CFLAGS} s390.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
@@ -474,6 +508,21 @@ xen_hyper_global_data.o: ${GENERIC_HFILES} xen_hyper_global_data.c
 xen_hyper_dump_tables.o: ${GENERIC_HFILES} xen_hyper_dump_tables.c
 	${CC} -c ${CRASH_CFLAGS} xen_hyper_dump_tables.c ${WARNING_OPTIONS} ${WARNING_ERROR}
 
+xen_dom0.o: ${GENERIC_HFILES} xen_dom0.c
+	${CC} -c ${CRASH_CFLAGS} xen_dom0.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+ramdump.o: ${GENERIC_HFILES} ${REDHAT_HFILES} ramdump.c
+	${CC} -c ${CRASH_CFLAGS} ramdump.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+vmware_vmss.o: ${GENERIC_HFILES} ${VMWARE_HFILES} vmware_vmss.c
+	${CC} -c ${CRASH_CFLAGS} vmware_vmss.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+kaslr_helper.o: ${GENERIC_HFILES} kaslr_helper.c
+	${CC} -c ${CRASH_CFLAGS} kaslr_helper.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
+bpf.o: ${GENERIC_HFILES} bpf.c
+	${CC} -c ${CRASH_CFLAGS} bpf.c ${WARNING_OPTIONS} ${WARNING_ERROR}
+
 ${PROGRAM}: force
 	@make --no-print-directory all
 
@@ -547,7 +596,8 @@ do_release:
 	.rh_rpm_package crash.8 ${EXTENSION_SOURCE_FILES} ${MEMORY_DRIVER_FILES} | \
 	(cd ./RELDIR/${PROGRAM}-${VERSION}; tar xf -)
 	@cp ${GDB}.tar.gz ./RELDIR/${PROGRAM}-${VERSION}
-	@./${PROGRAM} --no_scroll --no_crashrc -h README > ./RELDIR/${PROGRAM}-${VERSION}/README
+	@./${PROGRAM} --no_scroll --no_crashrc -h README > README
+	@cp README ./RELDIR/${PROGRAM}-${VERSION}/README
 	@(cd ./RELDIR; find . -exec chown root {} ";")
 	@(cd ./RELDIR; find . -exec chgrp root {} ";")
 	@(cd ./RELDIR; find . -exec touch {} ";")

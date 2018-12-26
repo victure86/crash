@@ -63,7 +63,7 @@
 #define HYPERVISOR_VIRT_START (0xffff800000000000)
 #define HYPERVISOR_VIRT_END   (0xffff880000000000)
 #define DIRECTMAP_VIRT_START  (0xffff830000000000)
-#define DIRECTMAP_VIRT_END    (0xffff840000000000)
+#define DIRECTMAP_VIRT_END    (0xffff880000000000)
 #define PAGE_OFFSET_XEN_HYPER DIRECTMAP_VIRT_START
 #define XEN_VIRT_START        (xht->xen_virt_start)
 #define XEN_VIRT_ADDR(vaddr) \
@@ -678,6 +678,10 @@ struct xen_hyper_offset_table {
 	long domain_debugger_attached;
 	long domain_is_polling;
 	long domain_is_dying;
+	/*
+	 * This changed from xen-4.2.5 to domain_controller_pause_count.
+	 * See below!
+	 */
 	long domain_is_paused_by_controller;
 	long domain_is_shutting_down;
 	long domain_is_shut_down;
@@ -752,6 +756,8 @@ struct xen_hyper_offset_table {
 	long vcpu_runstate_info_state;
 	long vcpu_runstate_info_state_entry_time;
 	long vcpu_runstate_info_time;
+	/* domain - changed item see domain_is_paused_by_controller */
+	long domain_controller_pause_count;
 };
 
 /*
